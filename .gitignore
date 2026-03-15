@@ -1,0 +1,16 @@
+.env
+venv/
+__pycache__/
+*.pyc
+trades.json
+metrics.json
+bot.log
+debug.py
+debug2.py
+monte_carlo.py
+portfolio_manager.py
+risk_manager.py
+trader.py
+utils.py
+Procfile.txt
+railway.json
