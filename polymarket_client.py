@@ -18,7 +18,7 @@ class PolymarketClient:
     def __init__(self):
         self.api_key       = os.getenv("POLYMARKET_API_KEY", "")
         self.private_key   = os.getenv("POLYMARKET_PRIVATE_KEY", "")
-        self.wallet        = os.getenv("POLYMARKET_WALLET", "")
+        self.wallet        = os.getenv("POLYMARKET_WALLET", "").strip().lstrip("=")
         self.session       = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
 
