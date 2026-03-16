@@ -10,11 +10,13 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 
 import config
-from market_scanner    import MarketScanner
-from opportunity_engine import OpportunityEngine
-from execution_engine  import ExecutionEngine
-from position_manager  import PositionManager
-from metrics           import Metrics
+from market_scanner      import MarketScanner
+from opportunity_engine  import OpportunityEngine
+from execution_engine    import ExecutionEngine
+from position_manager    import PositionManager
+from metrics             import Metrics
+from resolution_tracker  import ResolutionTracker
+from diagnostics         import Diagnostics
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,11 +29,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app)  # Allow dashboard to fetch data
+CORS(app)
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "ts": datetime.now(timezone.utc).isoformat()})
+    return jsonify({"status": "ok",
+                    "ts": datetime.now(timezone.utc).isoformat()})
 
 @app.route("/metrics")
 def metrics_endpoint():
@@ -41,20 +44,42 @@ def metrics_endpoint():
             return jsonify(json.load(f))
     return jsonify({"status": "no data yet"})
 
+@app.route("/diagnostics")
+def diagnostics_endpoint():
+    import json, os
+    if os.path.exists("diagnostics.json"):
+        with open("diagnostics.json") as f:
+            return jsonify(json.load(f))
+    return jsonify({"status": "no diagnostics yet"})
+
+@app.route("/resolved")
+def resolved_endpoint():
+    import json, os
+    if os.path.exists("resolved_trades.json"):
+        with open("resolved_trades.json") as f:
+            data = json.load(f)
+            return jsonify(data[-50:])  # last 50
+    return jsonify([])
+
 def run_bot():
     scanner   = MarketScanner()
     engine    = OpportunityEngine()
     executor  = ExecutionEngine()
     metrics   = Metrics()
+    tracker   = ResolutionTracker()
+    diag      = Diagnostics(tracker)
 
     balance   = scanner.client.get_balance()
     positions = PositionManager(starting_balance=balance)
     logger.info(f"Bot started | Balance: ${balance:.2f} | "
                 f"Scan interval: {config.SCAN_INTERVAL_SECONDS}s")
 
+    scan_count = 0
+
     while True:
         try:
-            loop_start = time.time()
+            loop_start  = time.time()
+            scan_count += 1
 
             current_balance = scanner.client.get_balance()
             positions.update_balance(current_balance)
@@ -63,6 +88,13 @@ def run_bot():
                 logger.critical("Drawdown breached — bot paused.")
                 time.sleep(300)
                 continue
+
+            # Check resolutions every scan
+            tracker.check_resolutions()
+
+            # Run diagnostics every 10 scans
+            if scan_count % 10 == 0:
+                diag.run()
 
             executor.cleanup_expired()
 
@@ -99,8 +131,25 @@ def run_bot():
                             size       = size,
                             confidence = market.confidence,
                         )
+                        # Register with resolution tracker
+                        tracker.register_trade(
+                            market_id  = market.market_id,
+                            question   = market.question,
+                            category   = market.category,
+                            entry_price= market.current_price,
+                            fair_value = market.fair_value,
+                            edge       = market.edge,
+                            confidence = market.confidence,
+                            size       = size,
+                            expiry     = market.expiry,
+                        )
 
-            metrics.save_summary(positions.summary())
+            # Save metrics with resolution summary
+            resolution_summary = tracker.get_summary()
+            metrics.save_summary({
+                **positions.summary(),
+                "resolution": resolution_summary,
+            })
 
             elapsed = time.time() - loop_start
             sleep   = max(0, config.SCAN_INTERVAL_SECONDS - elapsed)
