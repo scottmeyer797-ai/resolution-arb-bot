@@ -15,7 +15,7 @@ MAX_TIME_REMAINING_HRS  = 48     # expanded window (was 24)
 MIN_LIQUIDITY           = 20     # loosened for paper trading (was 50)
 
 # --- Position Sizing ---
-MAX_POSITION_PER_MARKET = 1      # PAPER MODE - set to 500 when going live
+MAX_POSITION_PER_MARKET = 0      # PAPER MODE - set to 500 when going live
 MAX_TOTAL_EXPOSURE      = 5000   # max USDC deployed at any time
 ORDER_SPLIT_LEVELS      = 3      # split orders across price levels
 

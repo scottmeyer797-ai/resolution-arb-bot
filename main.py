@@ -1,5 +1,6 @@
 # ============================================================
 # main.py — Resolution Arbitrage Bot
+# Simulates trades for diagnostics — no real money placed
 # ============================================================
 import time
 import logging
@@ -58,7 +59,7 @@ def resolved_endpoint():
     if os.path.exists("resolved_trades.json"):
         with open("resolved_trades.json") as f:
             data = json.load(f)
-            return jsonify(data[-50:])  # last 50
+            return jsonify(data[-50:])
     return jsonify([])
 
 def run_bot():
@@ -72,7 +73,8 @@ def run_bot():
     balance   = scanner.client.get_balance()
     positions = PositionManager(starting_balance=balance)
     logger.info(f"Bot started | Balance: ${balance:.2f} | "
-                f"Scan interval: {config.SCAN_INTERVAL_SECONDS}s")
+                f"Scan interval: {config.SCAN_INTERVAL_SECONDS}s | "
+                f"Paper mode: MAX_POSITION=${config.MAX_POSITION_PER_MARKET}")
 
     scan_count = 0
 
@@ -94,7 +96,12 @@ def run_bot():
 
             # Run diagnostics every 10 scans
             if scan_count % 10 == 0:
-                diag.run()
+                report = diag.run()
+                if report.get("recommendations"):
+                    logger.info(
+                        f"Diagnostics: {report['flaws_detected']} flaws, "
+                        f"{len(report['recommendations'])} recommendations"
+                    )
 
             executor.cleanup_expired()
 
@@ -106,49 +113,66 @@ def run_bot():
             else:
                 ranked = engine.rank(opportunities)
 
-                for market in ranked:
-                    exposure  = executor.get_exposure()
-                    available = positions.get_available_capital(exposure)
-
-                    valid, reason = engine.validate(market, exposure)
-                    if not valid:
-                        logger.debug(f"Skipped {market.market_id[:10]}: {reason}")
-                        continue
-
-                    size = engine.calculate_position_size(market, available)
-                    if size < 10:
-                        continue
-
-                    success = executor.execute(market, size)
-                    if success:
-                        metrics.record_trade(
-                            market_id  = market.market_id,
-                            question   = market.question,
-                            category   = market.category,
-                            price      = market.current_price,
-                            fair_value = market.fair_value,
-                            edge       = market.edge,
-                            size       = size,
-                            confidence = market.confidence,
+                # Register TOP opportunities for simulation tracking
+                # even if MAX_POSITION = 0 (no real trades placed)
+                sim_count = 0
+                for market in ranked[:50]:  # track top 50 per scan
+                    if market.market_id not in tracker.pending:
+                        size = engine.calculate_position_size(
+                            market,
+                            positions.get_available_capital(
+                                executor.get_exposure()
+                            )
                         )
-                        # Register with resolution tracker
+                        sim_size = max(size, 10.0)  # simulate at least $10
                         tracker.register_trade(
-                            market_id  = market.market_id,
-                            question   = market.question,
-                            category   = market.category,
-                            entry_price= market.current_price,
-                            fair_value = market.fair_value,
-                            edge       = market.edge,
-                            confidence = market.confidence,
-                            size       = size,
-                            expiry     = market.expiry,
+                            market_id   = market.market_id,
+                            question    = market.question,
+                            category    = market.category,
+                            entry_price = market.current_price,
+                            fair_value  = market.fair_value,
+                            edge        = market.edge,
+                            confidence  = market.confidence,
+                            size        = sim_size,
+                            expiry      = market.expiry,
                         )
+                        sim_count += 1
 
-            # Save metrics with resolution summary
+                if sim_count > 0:
+                    logger.info(
+                        f"Registered {sim_count} simulated trades "
+                        f"({tracker.get_pending_count()} pending resolution)"
+                    )
+
+                # Execute real trades only if MAX_POSITION > 0
+                if config.MAX_POSITION_PER_MARKET > 0:
+                    for market in ranked:
+                        exposure  = executor.get_exposure()
+                        available = positions.get_available_capital(exposure)
+                        valid, reason = engine.validate(market, exposure)
+                        if not valid:
+                            continue
+                        size = engine.calculate_position_size(market, available)
+                        if size < 10:
+                            continue
+                        success = executor.execute(market, size)
+                        if success:
+                            metrics.record_trade(
+                                market_id  = market.market_id,
+                                question   = market.question,
+                                category   = market.category,
+                                price      = market.current_price,
+                                fair_value = market.fair_value,
+                                edge       = market.edge,
+                                size       = size,
+                                confidence = market.confidence,
+                            )
+
             resolution_summary = tracker.get_summary()
             metrics.save_summary({
                 **positions.summary(),
-                "resolution": resolution_summary,
+                "resolution":         resolution_summary,
+                "pending_simulation": tracker.get_pending_count(),
             })
 
             elapsed = time.time() - loop_start
