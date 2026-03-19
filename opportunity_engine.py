@@ -1,99 +1,132 @@
-# ============================================================
-# opportunity_engine.py — Ranks and validates opportunities
-# ============================================================
-import logging
-from typing import List
-from market_scanner import MarketRecord
-import config
-
-logger = logging.getLogger(__name__)
-
 class OpportunityEngine:
 
-    def rank(self, markets: List[MarketRecord]) -> List[MarketRecord]:
-        """
-        Score and rank opportunities.
-        Higher score = trade first.
-        """
-        scored = []
-        for m in markets:
-            score = self._score(m)
-            scored.append((score, m))
+    def __init__(self):
+        pass
 
-        scored.sort(key=lambda x: x[0], reverse=True)
-        ranked = [m for _, m in scored]
+    # ---------- SWING DETECTION ----------
+    def detect_swings(self, candles, lookback=2):
+        if len(candles) < (lookback * 2 + 1):
+            return [], []
 
-        logger.info(f"Top opportunity: {ranked[0].question[:60]} | "
-                    f"edge={ranked[0].edge:.3f} conf={ranked[0].confidence:.3f}"
-                    if ranked else "No opportunities")
-        return ranked
+        swings_high = []
+        swings_low = []
 
-    def _score(self, m: MarketRecord) -> float:
-        """
-        Composite score weighting:
-          - Edge (40%) — bigger mispricing = better
-          - Confidence (40%) — higher certainty = better
-          - Time urgency (20%) — closer to expiry = more valuable
-        """
-        from datetime import datetime, timezone
-        hours_left = (m.expiry - datetime.now(timezone.utc)).total_seconds() / 3600
+        for i in range(lookback, len(candles) - lookback):
+            high = candles[i]["high"]
+            low = candles[i]["low"]
 
-        # Normalise time urgency: 1.0 at <1hr, 0.0 at 24hr
-        time_score  = max(0.0, 1.0 - (hours_left / 24.0))
+            is_swing_high = all(high > candles[i - j]["high"] for j in range(1, lookback + 1)) and \
+                            all(high > candles[i + j]["high"] for j in range(1, lookback + 1))
 
-        score = (
-            0.40 * m.edge +
-            0.40 * m.confidence +
-            0.20 * time_score
-        )
-        return score
+            is_swing_low = all(low < candles[i - j]["low"] for j in range(1, lookback + 1)) and \
+                           all(low < candles[i + j]["low"] for j in range(1, lookback + 1))
 
-    def validate(self, m: MarketRecord, current_exposure: float) -> tuple[bool, str]:
-        """
-        Final pre-trade validation.
-        Returns (is_valid, reason_if_rejected).
-        """
-        from datetime import datetime, timezone
+            if is_swing_high:
+                swings_high.append((i, high))
+            if is_swing_low:
+                swings_low.append((i, low))
 
-        hours_left = (m.expiry - datetime.now(timezone.utc)).total_seconds() / 3600
+        return swings_high, swings_low
 
-        if hours_left <= 0:
-            return False, "Market already expired"
 
-        if m.edge < config.MIN_EDGE:
-            return False, f"Edge too small: {m.edge:.3f}"
+    # ---------- TREND DETECTION ----------
+    def get_trend(self, swings_high, swings_low):
+        if len(swings_high) < 2 or len(swings_low) < 2:
+            return None
 
-        if m.confidence < config.CATEGORY_CONFIDENCE.get(m.category, config.MIN_CONFIDENCE):
-            return False, f"Confidence too low: {m.confidence:.3f}"
+        h1, h2 = swings_high[-2][1], swings_high[-1][1]
+        l1, l2 = swings_low[-2][1], swings_low[-1][1]
 
-        if m.liquidity < config.MIN_LIQUIDITY:
-            return False, f"Insufficient liquidity: {m.liquidity:.1f}"
+        if h2 > h1 and l2 > l1:
+            return "bullish"
+        elif h2 < h1 and l2 < l1:
+            return "bearish"
 
-        if current_exposure >= config.MAX_TOTAL_EXPOSURE:
-            return False, f"Max exposure reached: {current_exposure:.1f}"
+        return None
 
-        return True, "ok"
 
-    def calculate_position_size(self, m: MarketRecord,
-                                  available_capital: float) -> float:
-        """
-        Kelly-inspired position sizing, capped by config limits.
-        """
-        # Fractional Kelly: f = (p*b - q) / b
-        # where p = confidence, b = (1/price - 1), q = 1 - p
-        b = (1.0 / m.current_price) - 1.0
-        p = m.confidence
-        q = 1.0 - p
+    # ---------- 50% RETRACEMENT ----------
+    def valid_retracement(self, last_low, last_high, current_price, trend):
+        if last_low is None or last_high is None:
+            return False
 
-        if b <= 0:
-            return 0.0
+        if trend == "bullish":
+            fib_50 = last_low + (last_high - last_low) * 0.5
+            return current_price <= fib_50
 
-        kelly_fraction = (p * b - q) / b
-        half_kelly      = kelly_fraction * 0.5   # use half-Kelly for safety
+        if trend == "bearish":
+            fib_50 = last_high - (last_high - last_low) * 0.5
+            return current_price >= fib_50
 
-        raw_size = available_capital * half_kelly
-        capped   = min(raw_size, config.MAX_POSITION_PER_MARKET)
-        capped   = min(capped, m.liquidity * 0.5)  # don't take >50% of liquidity
-        capped   = max(capped, 0.0)
+        return False
 
-        return round(capped, 2)
+
+    # ---------- BOS DETECTION ----------
+    def detect_bos(self, swings_high, swings_low, trend, current_price):
+
+        if trend == "bullish":
+            if len(swings_high) == 0:
+                return False
+            last_high = swings_high[-1][1]
+            return current_price > last_high
+
+        if trend == "bearish":
+            if len(swings_low) == 0:
+                return False
+            last_low = swings_low[-1][1]
+            return current_price < last_low
+
+        return False
+
+
+    # ---------- MAIN ENTRY LOGIC ----------
+    def find_opportunity(self, h4_candles, m15_candles, polymarket_price):
+
+        if not h4_candles or not m15_candles:
+            return None
+
+        try:
+            # H4 structure
+            h4_highs, h4_lows = self.detect_swings(h4_candles)
+            trend = self.get_trend(h4_highs, h4_lows)
+
+            if trend is None or len(h4_highs) == 0 or len(h4_lows) == 0:
+                return None
+
+            last_high = h4_highs[-1][1]
+            last_low = h4_lows[-1][1]
+
+            current_price = m15_candles[-1]["close"]
+
+            # 50% retracement
+            if not self.valid_retracement(last_low, last_high, current_price, trend):
+                return None
+
+            # M15 structure
+            m15_highs, m15_lows = self.detect_swings(m15_candles)
+
+            bos = self.detect_bos(m15_highs, m15_lows, trend, current_price)
+
+            if not bos:
+                return None
+
+            # Polymarket filter
+            if trend == "bullish" and polymarket_price < 0.6:
+                return {
+                    "type": "BUY_YES",
+                    "trend": trend,
+                    "entry_price": polymarket_price
+                }
+
+            if trend == "bearish" and polymarket_price > 0.4:
+                return {
+                    "type": "BUY_NO",
+                    "trend": trend,
+                    "entry_price": polymarket_price
+                }
+
+            return None
+
+        except Exception as e:
+            print(f"OpportunityEngine Error: {e}")
+            return None
